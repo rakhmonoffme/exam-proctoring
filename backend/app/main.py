@@ -1,227 +1,337 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
+from fastapi.responses import HTMLResponse
 import json
 import asyncio
-import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-import logging
+from typing import Dict, List, Any
+import uuid
+from pathlib import Path
+
 from .config import settings
-from .events import ConnectionManager, Event, SessionManager
-from .services.scoring import RiskScorer
-from .services.mock_generator import MockDataGenerator
+from .events import WebSocketManager
+from .services.scoring import ScoringService
+from .services.audio_processor import AudioProcessor
+from .services.video_processor import VideoProcessor
+from .models.schemas import ExamSession, SuspiciousEvent, EventType
+from .db import Database
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI Proctoring System", version="1.0.0")
+# Initialize services
+ws_manager = WebSocketManager()
+scoring_service = ScoringService()
+audio_processor = AudioProcessor()
+video_processor = VideoProcessor()
+db = Database()
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Store active sessions
+active_sessions: Dict[str, ExamSession] = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await db.init_db()
+    print("🚀 AI Proctoring System started successfully!")
+    yield
+    # Shutdown (optional cleanup code can go here)
+    print("🔄 AI Proctoring System shutting down...")
+
+app = FastAPI(
+    title="AI Proctoring System", 
+    version="1.0.0",
+    lifespan=lifespan
 )
-
-# Initialize managers
-connection_manager = ConnectionManager()
-session_manager = SessionManager()
-risk_scorer = RiskScorer()
-mock_generator = MockDataGenerator()
-
-@app.get("/")
-async def root():
-    return {"message": "AI Proctoring System API", "version": "1.0.0"}
-
-@app.post("/api/sessions/start")
-async def start_session(student_id: str = "test_student"):
-    """Start a new proctoring session"""
-    session_id = str(uuid.uuid4())
-    session_data = {
-        "session_id": session_id,
-        "student_id": student_id,
-        "start_time": datetime.now().isoformat(),
-        "status": "active",
-        "events": [],
-        "risk_score": 0,
-        "flags": []
-    }
-    
-    session_manager.create_session(session_id, session_data)
-    logger.info(f"Started session {session_id} for student {student_id}")
-    
-    return {"session_id": session_id, "status": "started"}
-
-@app.get("/api/sessions/{session_id}")
-async def get_session(session_id: str):
-    """Get session details"""
-    session = session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    return session
-
-@app.get("/api/sessions/{session_id}/events")
-async def get_session_events(session_id: str, limit: int = 100):
-    """Get session events"""
-    session = session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    events = session.get("events", [])[-limit:]
-    return {"events": events, "total": len(session.get("events", []))}
-
-@app.post("/api/sessions/{session_id}/end")
-async def end_session(session_id: str):
-    """End a proctoring session"""
-    session = session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session["status"] = "completed"
-    session["end_time"] = datetime.now().isoformat()
-    
-    # Disconnect all clients for this session
-    await connection_manager.disconnect_session(session_id)
-    
-    return {"status": "session_ended", "session_id": session_id}
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for real-time communication"""
-    await connection_manager.connect(websocket, session_id)
+    await ws_manager.connect(websocket, session_id)
     
-    # Get or create session
-    session = session_manager.get_session(session_id)
-    if not session:
-        session_data = {
-            "session_id": session_id,
-            "student_id": "anonymous",
-            "start_time": datetime.now().isoformat(),
-            "status": "active",
-            "events": [],
-            "risk_score": 0,
-            "flags": []
-        }
-        session_manager.create_session(session_id, session_data)
-        session = session_data
+    # Create new session if not exists
+    if session_id not in active_sessions:
+        active_sessions[session_id] = ExamSession(
+            id=session_id,
+            student_name=f"Student_{session_id[:8]}",
+            start_time=datetime.now(),
+            risk_score=0,
+            status="ACTIVE",
+            events=[]
+        )
+        print(f"📝 Created new session: {session_id}")
+    else: 
+        active_sessions[session_id].status = "ACTIVE"
+        print(f"🔄 Reusing existing session {session_id}")
     
-    # Send initial session state
-    await websocket.send_text(json.dumps({
-        "type": "session_state",
-        "data": session
-    }))
+    # Send session initialization to client
+    init_message = {
+        "type": "session_initialized",
+        "session_id": session_id,
+        "student_name": active_sessions[session_id].student_name,
+        "timestamp": datetime.now().isoformat(),
+        "status": "connected"
+    }
+    await websocket.send_text(json.dumps(init_message))
+    print(f"📤 Sent session initialization for {session_id}")
     
     try:
         while True:
+            # Receive event from client
             data = await websocket.receive_text()
-            message = json.loads(data)
             
-            await handle_websocket_message(websocket, session_id, message)
-            
-    except WebSocketDisconnect:
-        logger.info(f"Client disconnected from session {session_id}")
-    except Exception as e:
-        logger.error(f"WebSocket error for session {session_id}: {e}")
-    finally:
-        connection_manager.disconnect(websocket, session_id)
-
-async def handle_websocket_message(websocket: WebSocket, session_id: str, message: dict):
-    """Handle incoming WebSocket messages"""
-    message_type = message.get("type")
-    
-    if message_type == "heartbeat":
-        await websocket.send_text(json.dumps({
-            "type": "heartbeat_ack",
-            "timestamp": datetime.now().isoformat()
-        }))
-        return
-    
-    if message_type == "ping":
-        await websocket.send_text(json.dumps({
-            "type": "pong",
-            "timestamp": datetime.now().isoformat()
-        }))
-        return
-    
-    # Handle proctoring events
-    if message_type in ["gaze_event", "audio_event", "screen_event"]:
-        await process_proctoring_event(session_id, message)
-
-async def process_proctoring_event(session_id: str, event_data: dict):
-    """Process and store proctoring events"""
-    session = session_manager.get_session(session_id)
-    if not session:
-        return
-    
-    # Create event object
-    event = Event(
-        event_id=str(uuid.uuid4()),
-        session_id=session_id,
-        timestamp=datetime.now().isoformat(),
-        event_type=event_data.get("type"),
-        data=event_data.get("data", {}),
-        severity=event_data.get("severity", "low")
-    )
-    
-    # Add event to session
-    session["events"].append(event.__dict__)
-    
-    # Update risk score
-    new_score = risk_scorer.calculate_risk_score(session["events"][-20:])  # Last 20 events
-    session["risk_score"] = new_score
-    
-    # Check for flags
-    if new_score > 10:
-        flag = {
-            "id": str(uuid.uuid4()),
-            "timestamp": datetime.now().isoformat(),
-            "type": "high_risk",
-            "description": f"Risk score exceeded threshold: {new_score}",
-            "events": session["events"][-5:]  # Include recent events
-        }
-        session["flags"].append(flag)
-    
-    # Broadcast to all connected clients for this session
-    broadcast_data = {
-        "type": "event_update",
-        "data": {
-            "event": event.__dict__,
-            "risk_score": new_score,
-            "total_events": len(session["events"]),
-            "flags": session["flags"][-10:]  # Last 10 flags
-        }
-    }
-    
-    await connection_manager.broadcast_to_session(session_id, broadcast_data)
-
-# Background task to generate mock data for demo
-@app.on_event("startup")
-async def startup_event():
-    """Start background tasks"""
-    asyncio.create_task(mock_data_generator())
-
-async def mock_data_generator():
-    """Generate mock events for demo purposes"""
-    while True:
-        await asyncio.sleep(5)  # Generate every 5 seconds
-        
-        # Generate mock events for active sessions
-        active_sessions = session_manager.get_active_sessions()
-        
-        for session_id in active_sessions:
-            if len(connection_manager.get_session_connections(session_id)) > 0:
-                mock_event = mock_generator.generate_random_event()
-                mock_message = {
-                    "type": mock_event["type"],
-                    "data": mock_event["data"],
-                    "severity": mock_event["severity"]
+            try:
+                event_data = json.loads(data)
+                message_type = event_data.get('type', 'unknown')
+                print(f"📥 Received message: {message_type} for {session_id}")
+                
+                # Handle different message types
+                if message_type == 'heartbeat':
+                    # Respond to heartbeat
+                    pong_message = {
+                        "type": "pong",
+                        "session_id": session_id,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await websocket.send_text(json.dumps(pong_message))
+                    print(f"💓 Sent pong to {session_id}")
+                    continue
+                
+                elif message_type == 'ping':
+                    # Respond to ping
+                    pong_message = {
+                        "type": "pong",
+                        "session_id": session_id,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await websocket.send_text(json.dumps(pong_message))
+                    print(f"🏓 Sent pong response to {session_id}")
+                    continue
+                
+                elif message_type == 'pong':
+                    # Just acknowledge pong
+                    print(f"🏓 Received pong from {session_id}")
+                    continue
+                
+                elif message_type in ['suspicious_event', 'MULTIPLE_FACES', 'HEAD_MOVEMENT', 'AUDIO_DETECTION', 'FACE_NOT_DETECTED', 'UNKNOWN']:
+                    # Process suspicious event
+                    print(f"⚠️ Processing suspicious event: {message_type}")
+                    await process_event(session_id, event_data)
+                    
+                    # 🔧 FIX: Send acknowledgment to client
+                    ack_message = {
+                        "type": "event_processed",
+                        "event_type": message_type,
+                        "session_id": session_id,
+                        "timestamp": datetime.now().isoformat(),
+                        "current_risk_score": active_sessions[session_id].risk_score
+                    }
+                    await websocket.send_text(json.dumps(ack_message))
+                    print(f"✅ Processed and acknowledged event: {message_type}")
+                
+                else:
+                    print(f"⚠️ Unknown message type: {message_type}")
+                    # Still acknowledge unknown messages
+                    ack_message = {
+                        "type": "message_received",
+                        "original_type": message_type,
+                        "session_id": session_id,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await websocket.send_text(json.dumps(ack_message))
+                    
+            except json.JSONDecodeError as e:
+                print(f"❌ JSON decode error: {e}")
+                error_message = {
+                    "type": "error",
+                    "message": "Invalid JSON format",
+                    "session_id": session_id,
+                    "timestamp": datetime.now().isoformat()
                 }
-                await process_proctoring_event(session_id, mock_message)
+                await websocket.send_text(json.dumps(error_message))
+                
+            except Exception as e:
+                print(f"❌ Error processing message: {e}")
+                import traceback
+                traceback.print_exc()
+                error_message = {
+                    "type": "error", 
+                    "message": f"Processing error: {str(e)}",
+                    "session_id": session_id,
+                    "timestamp": datetime.now().isoformat()
+                }
+                await websocket.send_text(json.dumps(error_message))
+                
+    except WebSocketDisconnect:
+        print(f"🔌 WebSocket disconnected for session: {session_id}")
+        # 🔧 FIX: Use correct method name
+        await ws_manager.disconnect(session_id, websocket)
+        if session_id in active_sessions:
+            active_sessions[session_id].status = "DISCONNECTED"
+        print(f"🧹 Cleaned up session {session_id}")
+    except Exception as e:
+        print(f"❌ WebSocket error for {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        # 🔧 FIX: Use correct method name
+        await ws_manager.disconnect(session_id, websocket)
+        if session_id in active_sessions:
+            active_sessions[session_id].status = "ERROR"
+
+
+async def process_event(session_id: str, event_data: Dict[str, Any]):
+    """Process incoming suspicious event and update risk score"""
+    try:
+        session = active_sessions.get(session_id)
+        if not session:
+            print(f"⚠️ Session {session_id} not found for event processing")
+            return
+        
+        # Create suspicious event
+        event = SuspiciousEvent(
+            id=str(uuid.uuid4()),
+            session_id=session_id,
+            timestamp=datetime.now(),
+            event_type=EventType(event_data.get('type', 'UNKNOWN')),
+            confidence=event_data.get('confidence', 0.5),
+            details=event_data.get('details', {}),
+            severity=event_data.get('severity', 'LOW')
+        )
+        
+        # Add to session events
+        session.events.append(event)
+        print(f"➕ Added event {event.event_type.value} to session {session_id}")
+        
+        # Update risk score
+        old_score = session.risk_score
+        new_score = scoring_service.calculate_risk_score(session.events)
+        session.risk_score = new_score
+        
+        # Update status based on risk score
+        old_status = session.status
+        if new_score > 15:
+            session.status = "HIGH_RISK"
+        elif new_score > 8:
+            session.status = "MODERATE_RISK"
+        else:
+            session.status = "LOW_RISK"
+        
+        print(f"📊 Session {session_id}: Risk score {old_score} → {new_score}, Status: {old_status} → {session.status}")
+        
+        # Store in database
+        try:
+            await db.store_event(event)
+            await db.update_session(session)
+            print(f"💾 Stored event and updated session in database: {session_id}")
+        except Exception as e:
+            print(f"❌ Database error for session {session_id}: {e}")
+        
+        # Broadcast update to all connected clients
+        try:
+            update_data = {
+                "type": "session_update",
+                "session": {
+                    "id": session.id,
+                    "student_name": session.student_name,
+                    "risk_score": session.risk_score,
+                    "status": session.status,
+                    "event_count": len(session.events),
+                    "last_event": {
+                        "type": event.event_type.value,
+                        "timestamp": event.timestamp.isoformat(),
+                        "confidence": event.confidence,
+                        "severity": event.severity
+                    }
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            await ws_manager.broadcast(json.dumps(update_data))
+            print(f"📡 Broadcast session update for {session_id}")
+        except Exception as e:
+            print(f"❌ Broadcast error: {e}")
+            
+    except Exception as e:
+        print(f"❌ Error in process_event for session {session_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
+@app.get("/api/sessions")
+async def get_active_sessions():
+    """Get all active exam sessions"""
+    sessions_data = []
+    for session in active_sessions.values():
+        sessions_data.append({
+            "id": session.id,
+            "student_name": session.student_name,
+            "start_time": session.start_time.isoformat(),
+            "risk_score": session.risk_score,
+            "status": session.status,
+            "event_count": len(session.events),
+            "is_connected": ws_manager.is_connected(session.id) if hasattr(ws_manager, 'is_connected') else False
+        })
+    return {"sessions": sessions_data, "total": len(sessions_data)}
+
+@app.get("/api/sessions/{session_id}/events")
+async def get_session_events(session_id: str):
+    """Get events for a specific session"""
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    events_data = []
+    for event in session.events[-20:]:  # Last 20 events
+        events_data.append({
+            "id": event.id,
+            "timestamp": event.timestamp.isoformat(),
+            "type": event.event_type.value,
+            "confidence": event.confidence,
+            "severity": event.severity,
+            "details": event.details
+        })
+    
+    return {
+        "events": events_data, 
+        "total": len(session.events),
+        "session_id": session_id
+    }
+
+@app.post("/api/sessions/{session_id}/flag")
+async def flag_session(session_id: str):
+    """Manually flag a session"""
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    old_status = session.status
+    session.status = "FLAGGED"
+    await db.update_session(session)
+    
+    print(f"🚩 Session {session_id} manually flagged (was: {old_status})")
+    
+    # Broadcast update
+    update_data = {
+        "type": "session_flagged",
+        "session_id": session_id,
+        "status": "FLAGGED",
+        "timestamp": datetime.now().isoformat()
+    }
+    await ws_manager.broadcast(json.dumps(update_data))
+    
+    return {"message": "Session flagged successfully", "session_id": session_id}
+
+# Health check endpoint
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "active_sessions": len(active_sessions),
+        "websocket_connections": ws_manager.get_connection_count() if hasattr(ws_manager, 'get_connection_count') else 0,
+        "timestamp": datetime.now().isoformat()
+    }
+
+# Serve frontend static files in production
+frontend_dist = Path("../frontend/dist")
+if frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
 
 if __name__ == "__main__":
     import uvicorn

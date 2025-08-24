@@ -1,105 +1,118 @@
-from typing import Dict, List, Optional, Set
 from fastapi import WebSocket
-from pydantic import BaseModel
-from datetime import datetime
+from typing import Dict, Set
 import json
-import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 
-class Event(BaseModel):
-    event_id: str
-    session_id: str
-    timestamp: str
-    event_type: str
-    data: dict
-    severity: str = "low"
-
-class ConnectionManager:
+class WebSocketManager:
     def __init__(self):
-        self.active_connections: Dict[str, List[WebSocket]] = {}
+        # Store active connections by session_id
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
+        # Store session_id by websocket for reverse lookup
         self.connection_sessions: Dict[WebSocket, str] = {}
-
+    
     async def connect(self, websocket: WebSocket, session_id: str):
+        """Accept new WebSocket connection"""
         await websocket.accept()
         
+        # Add to active connections
         if session_id not in self.active_connections:
-            self.active_connections[session_id] = []
+            self.active_connections[session_id] = set()
         
-        self.active_connections[session_id].append(websocket)
+        self.active_connections[session_id].add(websocket)
         self.connection_sessions[websocket] = session_id
         
-        logger.info(f"Client connected to session {session_id}. Total connections: {len(self.active_connections[session_id])}")
-
-    def disconnect(self, websocket: WebSocket, session_id: str):
-        if session_id in self.active_connections:
-            try:
-                self.active_connections[session_id].remove(websocket)
-                if websocket in self.connection_sessions:
-                    del self.connection_sessions[websocket]
-                
+        connection_count = self.get_connection_count()
+        logger.info(f"🔌 WebSocket connected for session: {session_id}")
+        logger.info(f"📊 Total active connections: {connection_count}")
+        
+        # Don't send welcome message here - let main.py handle session initialization
+        # This prevents duplicate/conflicting messages
+    
+    async def disconnect(self, session_id: str = None, websocket: WebSocket = None):
+        """Disconnect WebSocket - can be called with session_id only or both parameters"""
+        if websocket and session_id:
+            # Remove specific connection
+            if session_id in self.active_connections:
+                self.active_connections[session_id].discard(websocket)
                 if not self.active_connections[session_id]:
                     del self.active_connections[session_id]
+            
+            if websocket in self.connection_sessions:
+                del self.connection_sessions[websocket]
                 
-                logger.info(f"Client disconnected from session {session_id}")
-            except ValueError:
-                pass
-
-    async def disconnect_session(self, session_id: str):
-        """Disconnect all clients from a session"""
-        if session_id in self.active_connections:
-            connections = self.active_connections[session_id].copy()
-            for websocket in connections:
-                try:
-                    await websocket.close(code=1000, reason="Session ended")
-                except:
-                    pass
-            del self.active_connections[session_id]
-
-    async def send_personal_message(self, message: dict, websocket: WebSocket):
-        try:
-            await websocket.send_text(json.dumps(message))
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}")
-
-    async def broadcast_to_session(self, session_id: str, message: dict):
+        elif session_id and not websocket:
+            # Remove all connections for session (find websocket from session_id)
+            if session_id in self.active_connections:
+                for ws in list(self.active_connections[session_id]):
+                    if ws in self.connection_sessions:
+                        del self.connection_sessions[ws]
+                del self.active_connections[session_id]
+                
+        elif websocket and not session_id:
+            # Remove connection by websocket (lookup session_id)
+            if websocket in self.connection_sessions:
+                session_id = self.connection_sessions[websocket]
+                del self.connection_sessions[websocket]
+                
+                if session_id in self.active_connections:
+                    self.active_connections[session_id].discard(websocket)
+                    if not self.active_connections[session_id]:
+                        del self.active_connections[session_id]
+        
+        connection_count = self.get_connection_count()
+        logger.info(f"🔌 WebSocket disconnected for session: {session_id}")
+        logger.info(f"📊 Remaining connections: {connection_count}")
+    
+    async def disconnect_websocket(self, websocket: WebSocket):
+        """Disconnect by websocket instance (for compatibility with main.py)"""
+        session_id = self.connection_sessions.get(websocket)
+        if session_id:
+            await self.disconnect(session_id, websocket)
+        else:
+            # If websocket not found in sessions, just remove it
+            logger.warning("🔌 Websocket not found in sessions during disconnect")
+    
+    async def send_personal_message(self, message: str, session_id: str):
+        """Send message to specific session"""
         if session_id in self.active_connections:
             disconnected = []
-            for connection in self.active_connections[session_id]:
+            for websocket in self.active_connections[session_id]:
                 try:
-                    await connection.send_text(json.dumps(message))
+                    await websocket.send_text(message)
                 except Exception as e:
-                    logger.error(f"Failed to broadcast to connection: {e}")
-                    disconnected.append(connection)
+                    logger.error(f"❌ Error sending message to {session_id}: {e}")
+                    disconnected.append(websocket)
             
-            # Remove disconnected connections
-            for connection in disconnected:
-                self.disconnect(connection, session_id)
-
-    def get_session_connections(self, session_id: str) -> List[WebSocket]:
-        return self.active_connections.get(session_id, [])
-
-class SessionManager:
-    def __init__(self):
-        self.sessions: Dict[str, dict] = {}
-
-    def create_session(self, session_id: str, session_data: dict):
-        self.sessions[session_id] = session_data
-        logger.info(f"Created session {session_id}")
-
-    def get_session(self, session_id: str) -> Optional[dict]:
-        return self.sessions.get(session_id)
-
-    def delete_session(self, session_id: str):
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            logger.info(f"Deleted session {session_id}")
-
-    def get_active_sessions(self) -> List[str]:
-        return [sid for sid, session in self.sessions.items() 
-                if session.get("status") == "active"]
-
-    def update_session(self, session_id: str, updates: dict):
-        if session_id in self.sessions:
-            self.sessions[session_id].update(updates)
+            # Clean up disconnected websockets
+            for ws in disconnected:
+                await self.disconnect(session_id, ws)
+    
+    async def broadcast(self, message: str):
+        """Broadcast message to all connected sessions"""
+        disconnected = []
+        
+        for session_id, connections in self.active_connections.items():
+            for websocket in list(connections):
+                try:
+                    await websocket.send_text(message)
+                except Exception as e:
+                    logger.error(f"❌ Error broadcasting to {session_id}: {e}")
+                    disconnected.append((session_id, websocket))
+        
+        # Clean up disconnected websockets
+        for session_id, ws in disconnected:
+            await self.disconnect(session_id, ws)
+    
+    def get_session_count(self) -> int:
+        """Get number of active sessions"""
+        return len(self.active_connections)
+    
+    def get_connection_count(self) -> int:
+        """Get total number of active connections"""
+        return sum(len(connections) for connections in self.active_connections.values())
+    
+    def is_session_connected(self, session_id: str) -> bool:
+        """Check if session has active connections"""
+        return session_id in self.active_connections and len(self.active_connections[session_id]) > 0
